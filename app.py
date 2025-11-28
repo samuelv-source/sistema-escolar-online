@@ -6,15 +6,17 @@ from datetime import datetime
 from fpdf import FPDF
 import hashlib
 import io
+import base64
+from PIL import Image
 
 # --- CONFIGURAÇÃO ---
 st.set_page_config(page_title="Sistema Online PROATI", layout="wide", page_icon="☁️")
 
-# --- REGRAS DE NEGÓCIO (QUEM MANDA) ---
+# --- REGRAS ---
 CARGOS_ADMIN = ["PROATI", "Diretor", "Vice-Diretor", "Coordenador"]
 CARGOS_GERAL = ["PROATI", "Diretor", "Vice-Diretor", "Coordenador", "GOE", "Professor", "Secretaria", "Outros"]
 
-# --- CONEXÃO COM GOOGLE SHEETS ---
+# --- CONEXÃO GOOGLE SHEETS ---
 def conectar_gsheets():
     try:
         scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
@@ -23,184 +25,231 @@ def conectar_gsheets():
         client = gspread.authorize(creds)
         return client.open("SISTEMA_DB")
     except Exception as e:
-        st.error(f"Erro de Conexão: {e}")
+        st.error(f"Erro Conexão: {e}")
         return None
 
-# --- FUNÇÕES DE BANCO DE DADOS ---
+# --- FUNÇÕES ÚTEIS ---
 def carregar_dados(aba):
-    try:
-        sh = conectar_gsheets()
-        if sh:
-            ws = sh.worksheet(aba)
-            dados = ws.get_all_records()
-            return pd.DataFrame(dados)
-    except: return pd.DataFrame()
+    sh = conectar_gsheets()
+    if sh: return pd.DataFrame(sh.worksheet(aba).get_all_records())
     return pd.DataFrame()
 
 def adicionar_linha(aba, lista):
     sh = conectar_gsheets()
-    if sh:
-        sh.worksheet(aba).append_row(lista)
+    if sh: sh.worksheet(aba).append_row(lista)
 
 def hash_pw(pw): return hashlib.sha256(str(pw).encode()).hexdigest()
 
-def login(cie, user, pw):
-    df_usr = carregar_dados("Usuarios")
-    if df_usr.empty: return "user_error"
-    
-    # Filtra usuário e CIE
-    usuario = df_usr[
-        (df_usr['user'].astype(str) == str(user)) & 
-        (df_usr['cie'].astype(str) == str(cie))
-    ]
-    
-    if not usuario.empty:
-        if usuario.iloc[0]['pass'] == hash_pw(pw):
-            return usuario.iloc[0]
-    return "user_error"
+# --- PROCESSAMENTO DE IMAGEM (Reduzir para caber no Sheets) ---
+def processar_imagem(uploaded_file):
+    if uploaded_file is None: return ""
+    try:
+        # Abre a imagem
+        img = Image.open(uploaded_file)
+        # Reduz o tamanho (Thumbnail) para não estourar o limite do Sheets
+        img.thumbnail((400, 400)) 
+        # Converte para texto (Base64)
+        buffered = io.BytesIO()
+        img.save(buffered, format="JPEG", quality=50)
+        img_str = base64.b64encode(buffered.getvalue()).decode()
+        return img_str
+    except: return ""
 
-def recuperar_acesso(cie, frase):
-    df = carregar_dados("Escola")
-    if df.empty: return False
-    esc = df[df['cie'].astype(str) == str(cie)]
-    if not esc.empty and esc.iloc[0]['chave'] == hash_pw(frase): return True
-    return False
+def string_para_imagem(img_str):
+    if not img_str: return None
+    try:
+        return base64.b64decode(img_str)
+    except: return None
 
-def salvar_nova_senha(user, new_pw):
+# --- FUNÇÕES DE CRUD (Editar/Excluir) ---
+def excluir_item(aba, coluna_id, valor_id):
     sh = conectar_gsheets()
     if sh:
-        ws = sh.worksheet("Usuarios")
-        cell = ws.find(user)
-        ws.update_cell(cell.row, 2, hash_pw(new_pw))
+        ws = sh.worksheet(aba)
+        cell = ws.find(str(valor_id)) # Acha a célula com o ID (Serial ou ID gerado)
+        if cell:
+            ws.delete_rows(cell.row)
+            return True
+    return False
 
-def instalar_escola(cie, nome, chave, user, pw, nm, cg):
-    df = carregar_dados("Escola")
-    if not df.empty and str(cie) in df['cie'].astype(str).values: return False
-    adicionar_linha("Escola", [str(cie), nome, hash_pw(chave)])
-    adicionar_linha("Usuarios", [user, hash_pw(pw), nm, cg, str(cie)])
-    return True
+def atualizar_item(aba, linha_id, novos_dados):
+    # ATENÇÃO: Editar no Sheets é complexo. 
+    # Estratégia: Excluir a linha antiga e adicionar a nova no final.
+    if excluir_item(aba, "serial", linha_id): # Usando Serial como ID temporário
+        adicionar_linha(aba, novos_dados)
+        return True
+    return False
 
-def cadastrar_usuario_extra(user, pw, nm, cg, cie):
-    # Verifica se usuário já existe
+# --- LOGIN ---
+def login(cie, user, pw):
     df = carregar_dados("Usuarios")
-    if not df.empty and user in df['user'].values:
-        return False
-    adicionar_linha("Usuarios", [user, hash_pw(pw), nm, cg, str(cie)])
-    return True
+    if df.empty: return "erro"
+    u = df[(df['user'].astype(str)==str(user)) & (df['cie'].astype(str)==str(cie))]
+    if not u.empty and u.iloc[0]['pass'] == hash_pw(pw): return u.iloc[0]
+    return "erro"
 
-# --- PDF ---
-def mk_pdf(df, escola, user):
-    pdf = FPDF(); pdf.add_page(); pdf.set_font("Arial", 'B', 14); pdf.cell(0,10,f"INVENTARIO: {escola}",ln=True,align='C')
-    pdf.set_font("Arial", size=10); pdf.cell(0,10,f"Gerado em: {datetime.now().strftime('%d/%m/%Y')}",ln=True,align='C'); pdf.ln(5)
-    cols = [30,40,30,20,40]; hd = ["Tipo","Modelo","Serial","Pat","Sit"]
-    pdf.set_font("Arial",'B',8); pdf.set_fill_color(240,240,240)
-    for i in range(5): pdf.cell(cols[i],8,hd[i],1,0,'C',1)
-    pdf.ln(); pdf.set_font("Arial",size=7)
+# --- PDF COM ASSINATURA ---
+def mk_pdf(df, escola, user_nome):
+    pdf = FPDF(); pdf.add_page(); pdf.set_font("Arial", 'B', 14)
+    pdf.cell(0,10,f"INVENTARIO: {escola}",ln=True,align='C')
+    pdf.set_font("Arial", size=10)
+    pdf.cell(0,10,f"Data: {datetime.now().strftime('%d/%m/%Y')}",ln=True,align='C'); pdf.ln(5)
+    
+    # Cabeçalho Tabela
+    cols = [25, 45, 30, 20, 25, 45] # Ajuste largura
+    hd = ["Tipo", "Nome/Modelo", "Serial", "Patr.", "NF", "Situação"]
+    pdf.set_font("Arial",'B',7); pdf.set_fill_color(230,230,230)
+    for i in range(6): pdf.cell(cols[i],8,hd[i],1,0,'C',1)
+    pdf.ln()
+    
+    # Dados
+    pdf.set_font("Arial",size=7)
     for _,r in df.iterrows():
-        pdf.cell(cols[0],8,str(r['tipo'])[:15],1); pdf.cell(cols[1],8,str(r['nome'])[:20],1)
-        pdf.cell(cols[2],8,str(r['serial'])[:15],1); pdf.cell(cols[3],8,str(r['pat'])[:10],1)
-        pdf.cell(cols[4],8,str(r['sit'])[:20],1); pdf.ln()
+        pdf.cell(cols[0],8,str(r['tipo'])[:15],1)
+        pdf.cell(cols[1],8,str(r['nome'])[:25],1)
+        pdf.cell(cols[2],8,str(r['serial'])[:15],1)
+        pdf.cell(cols[3],8,str(r['pat'])[:10],1)
+        pdf.cell(cols[4],8,str(r['nf'])[:10],1)
+        pdf.cell(cols[5],8,str(r['sit'])[:25],1)
+        pdf.ln()
+    
+    # Assinatura
+    pdf.ln(20)
+    pdf.cell(0,5,"______________________________________________________", ln=True, align='C')
+    pdf.cell(0,5,f"Assinado por: {user_nome}", ln=True, align='C')
+    pdf.cell(0,5,f"Cargo: {st.session_state['data']['cargo']}", ln=True, align='C')
+    
     return pdf.output(dest='S').encode('latin-1')
 
 # --- APP ---
 if 'logado' not in st.session_state: st.session_state['logado'] = False
-if 'recup_step' not in st.session_state: st.session_state['recup_step'] = 0
 
 if not st.session_state['logado']:
     st.title("☁️ Sistema Escolar Online")
-    t1, t2, t3 = st.tabs(["🔐 Entrar", "🆘 Esqueci a Senha", "🏛️ Cadastrar Escola"])
-    
-    with t1:
-        with st.form("l"):
-            c=st.text_input("CIE"); u=st.text_input("User"); p=st.text_input("Senha",type="password")
-            if st.form_submit_button("Entrar"):
-                res = login(c,u,p)
-                if isinstance(res, str): st.error("Erro de Login.")
-                else: st.session_state['logado']=True; st.session_state['data']=res; st.rerun()
-    
-    with t2:
-        if st.session_state['recup_step']==0:
-            c1,c2=st.columns(2); rc=c1.text_input("CIE"); rk=c2.text_input("Frase",type="password")
-            if st.button("Validar"):
-                if recuperar_acesso(rc,rk): st.session_state['recup_step']=1; st.session_state['recup_cie']=rc; st.rerun()
-                else: st.error("Erro.")
-        else:
-            dfu = carregar_dados("Usuarios")
-            if not dfu.empty:
-                users = dfu[dfu['cie'].astype(str)==str(st.session_state['recup_cie'])]
-                target = st.selectbox("Usuário", users['user'].unique())
-                np = st.text_input("Nova Senha", type="password")
-                if st.button("Salvar"): salvar_nova_senha(target, np); st.success("Salvo!"); st.session_state['recup_step']=0
-
-    with t3:
-        with st.form("ne"):
-            c1,c2=st.columns(2); ci=c1.text_input("CIE"); es=c2.text_input("Escola"); ky=st.text_input("Frase",type="password")
-            st.divider(); nm=st.text_input("Nome"); us=st.text_input("User"); pw=st.text_input("Senha",type="password")
-            cg = st.selectbox("Cargo", CARGOS_ADMIN) # Apenas admins criam escola
-            if st.form_submit_button("Criar"):
-                if instalar_escola(ci,es,ky,us,pw,nm,cg): st.success("Criado!"); st.balloons()
-                else: st.error("Erro.")
+    with st.form("login"):
+        c=st.text_input("CIE"); u=st.text_input("Usuario"); p=st.text_input("Senha",type="password")
+        if st.form_submit_button("Entrar"):
+            res = login(c,u,p)
+            if isinstance(res, str): st.error("Dados incorretos.")
+            else: st.session_state['logado']=True; st.session_state['data']=res; st.rerun()
 
 else:
     ud = st.session_state['data']
-    st.sidebar.title(ud['nome']); st.sidebar.info(f"{ud['cargo']}\nCIE: {ud['cie']}")
-    if st.sidebar.button("Sair"): st.session_state['logado']=False; st.rerun()
-    
-    # --- LÓGICA DE PERMISSÃO ---
-    # Verifica se o cargo do usuário está na lista VIP
     eh_admin = ud['cargo'] in CARGOS_ADMIN
     
-    if eh_admin:
-        # Menu completo para Chefes
-        opcoes = ["📝 Cadastro Equipamento", "🔎 Consulta", "👥 Gestão de Equipe"]
-    else:
-        # Menu restrito para Professores/Outros
-        opcoes = ["🔎 Consulta"]
-
-    menu = st.sidebar.radio("Menu Principal", opcoes)
+    st.sidebar.info(f"👤 {ud['nome']}\n🏫 CIE: {ud['cie']}")
+    if st.sidebar.button("Sair"): st.session_state['logado']=False; st.rerun()
     
-    # --- CADASTRO (Só Admin vê) ---
-    if menu == "📝 Cadastro Equipamento":
+    # Menus
+    opcoes = ["📝 Cadastro", "🔎 Consulta/Gestão"]
+    if eh_admin: opcoes.append("👥 Equipe")
+    menu = st.sidebar.radio("Menu", opcoes)
+    
+    # --- CADASTRO ---
+    if menu == "📝 Cadastro":
         st.header("Novo Equipamento")
+        if not eh_admin: st.warning("Apenas visualização. Você não tem permissão de cadastro.")
+        
         with st.form("cad"):
-            c1,c2=st.columns(2); tp=c1.selectbox("Tipo", ["Chromebook", "Notebook", "Desktop", "Tablet", "Outros"])
-            nm=c2.text_input("Modelo"); sn=c1.text_input("Serial"); pt=c2.text_input("Patrimônio"); nf=st.text_input("NF")
-            st=c1.selectbox("Situação", ["Operacional","Inoperante"]); pb=c2.text_area("Problema")
-            if st.form_submit_button("Salvar"):
-                adicionar_linha("Equipamentos", [tp,nm,sn,pt,nf,st,pb,datetime.now().strftime("%d/%m/%Y"),ud['nome'],str(ud['cie'])])
-                st.success("Salvo!")
-
-    # --- CONSULTA (Todos veem) ---
-    elif menu == "🔎 Consulta":
-        st.header("Inventário")
-        df = carregar_dados("Equipamentos")
-        if not df.empty:
-            df = df[df['cie'].astype(str)==str(ud['cie'])]
-            st.dataframe(df)
-            if st.button("PDF"): st.download_button("Baixar PDF", mk_pdf(df, str(ud['cie']), ud['nome']), "rel.pdf")
-        else: st.info("Vazio")
-
-    # --- GESTÃO DE EQUIPE (Só Admin vê) ---
-    elif menu == "👥 Gestão de Equipe":
-        st.header("Cadastrar Novos Usuários")
-        st.info("Adicione professores ou outros funcionários para acessarem o sistema (apenas leitura).")
-        
-        with st.form("new_user"):
             c1,c2 = st.columns(2)
-            n_nome = c1.text_input("Nome Completo")
-            n_cargo = c2.selectbox("Cargo", CARGOS_GERAL)
-            n_user = c1.text_input("Login (Usuário)")
-            n_pass = c2.text_input("Senha", type="password")
+            tp = c1.selectbox("Tipo", ["Chromebook", "Notebook", "Desktop", "Tablet", "Monitor", "Impressora", "Outros"])
+            nm = c2.text_input("Nome/Modelo (Ex: Samsung Galaxy A7)")
             
-            if st.form_submit_button("Cadastrar Usuário"):
-                if cadastrar_usuario_extra(n_user, n_pass, n_nome, n_cargo, ud['cie']):
-                    st.success(f"Usuário {n_nome} cadastrado com sucesso!")
+            c3,c4 = st.columns(2)
+            sn = c3.text_input("Serial (Único)", help="Obrigatório para identificar")
+            pat = c4.text_input("Patrimônio")
+            
+            nf = st.text_input("Número da Nota Fiscal")
+            
+            # FOTO (Limitado a 1 para não travar o Sheets)
+            st.markdown("📸 **Foto da Nota Fiscal**")
+            foto_input = st.camera_input("Tirar Foto") or st.file_uploader("Upload Foto", type=['jpg','png'])
+            
+            c5,c6 = st.columns(2)
+            sit = c5.selectbox("Situação", ["Operacional", "Com Avaria", "Inoperante", "Baixado"])
+            prob = st.text_area("Descrição do Problema")
+            
+            # Botão Salvar (Só funciona se for admin e tiver Serial)
+            if st.form_submit_button("💾 Salvar na Nuvem"):
+                if eh_admin:
+                    if sn:
+                        foto_txt = processar_imagem(foto_input)
+                        # Ordem das colunas na planilha:
+                        # tipo, nome, serial, pat, nf, sit, prob, data, autor, cie, foto_b64
+                        adicionar_linha("Equipamentos", 
+                            [tp, nm, sn, pat, nf, sit, prob, 
+                             datetime.now().strftime("%d/%m/%Y"), ud['nome'], str(ud['cie']), foto_txt])
+                        st.success("✅ Salvo com sucesso!")
+                    else:
+                        st.error("Erro: O campo SERIAL é obrigatório.")
                 else:
-                    st.error("Erro: Usuário já existe.")
+                    st.error("Sem permissão.")
+
+    # --- CONSULTA E GESTÃO ---
+    elif menu == "🔎 Consulta/Gestão":
+        st.header("Gerenciar Inventário")
+        df = carregar_dados("Equipamentos")
         
-        st.divider()
-        st.subheader("Equipe Atual")
-        df_u = carregar_dados("Usuarios")
-        if not df_u.empty:
-            # Mostra apenas usuários da mesma escola
-            st.dataframe(df_u[df_u['cie'].astype(str) == str(ud['cie'])][['nome', 'cargo', 'user']], use_container_width=True)
+        if not df.empty:
+            df = df[df['cie'].astype(str) == str(ud['cie'])] # Filtra escola
+            
+            # Filtros
+            with st.expander("🔍 Filtros de Busca"):
+                busca = st.text_input("Digite Serial, Patrimônio ou Nome")
+                
+            if busca:
+                mask = df.astype(str).apply(lambda x: x.str.contains(busca, case=False, na=False)).any(axis=1)
+                df = df[mask]
+            
+            # Tabela
+            st.dataframe(df[['tipo', 'nome', 'serial', 'pat', 'sit', 'nf']], use_container_width=True)
+            
+            st.divider()
+            
+            # ÁREA DE GESTÃO (EDITAR/EXCLUIR)
+            if eh_admin:
+                st.subheader("🛠️ Editar ou Excluir Item")
+                serial_alvo = st.selectbox("Selecione o Item pelo Serial:", df['serial'].unique())
+                
+                # Pega dados do item selecionado
+                item = df[df['serial'] == serial_alvo].iloc[0]
+                
+                with st.expander(f"Editar: {item['nome']} ({serial_alvo})"):
+                    # Ver Foto Antiga
+                    if 'foto_b64' in item and str(item['foto_b64']).strip() != "":
+                        img_bytes = string_para_imagem(str(item['foto_b64']))
+                        if img_bytes: st.image(img_bytes, caption="Foto Salva", width=300)
+                    
+                    st.warning("⚠️ Para editar, o sistema apaga o antigo e cria um novo.")
+                    with st.form("editar_form"):
+                        n_sit = st.selectbox("Nova Situação", ["Operacional", "Com Avaria", "Inoperante"], index=0)
+                        n_prob = st.text_area("Atualizar Problema", value=item['prob'])
+                        
+                        col_bt1, col_bt2 = st.columns(2)
+                        if col_bt1.form_submit_button("🔄 Atualizar Situação"):
+                            # Cria nova linha baseada na antiga
+                            nova_linha = [item['tipo'], item['nome'], item['serial'], item['pat'], item['nf'], 
+                                          n_sit, n_prob, datetime.now().strftime("%d/%m/%Y"), ud['nome'], str(ud['cie']), item.get('foto_b64', '')]
+                            if atualizar_item("Equipamentos", serial_alvo, nova_linha):
+                                st.success("Atualizado! Recarregue a página.")
+                            else: st.error("Erro ao atualizar.")
+                            
+                        if col_bt2.form_submit_button("🗑️ EXCLUIR DEFINITIVAMENTE"):
+                            if excluir_item("Equipamentos", "serial", serial_alvo):
+                                st.success("Item excluído!")
+                            else: st.error("Erro ao excluir.")
+
+            # Botão PDF
+            st.divider()
+            if st.button("📄 Baixar Relatório PDF Assinado"):
+                st.download_button("Download PDF", mk_pdf(df, "Inventário Escolar", ud['nome']), "relatorio.pdf")
+
+    # --- EQUIPE ---
+    elif menu == "👥 Equipe" and eh_admin:
+        st.header("Cadastrar Equipe")
+        with st.form("eq"):
+            nm=st.text_input("Nome"); cg=st.selectbox("Cargo", CARGOS_GERAL)
+            us=st.text_input("User"); pw=st.text_input("Senha", type="password")
+            if st.form_submit_button("Cadastrar"):
+                adicionar_linha("Usuarios", [us, hash_pw(pw), nm, cg, str(ud['cie'])])
+                st.success("Usuário Cadastrado!")
