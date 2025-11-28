@@ -5,86 +5,86 @@ from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
 from fpdf import FPDF
 import hashlib
+import io
 
 # --- CONFIGURAÇÃO ---
 st.set_page_config(page_title="Sistema Online PROATI", layout="wide", page_icon="☁️")
 
+# --- REGRAS DE NEGÓCIO (QUEM MANDA) ---
+CARGOS_ADMIN = ["PROATI", "Diretor", "Vice-Diretor", "Coordenador"]
+CARGOS_GERAL = ["PROATI", "Diretor", "Vice-Diretor", "Coordenador", "GOE", "Professor", "Secretaria", "Outros"]
+
 # --- CONEXÃO COM GOOGLE SHEETS ---
 def conectar_gsheets():
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds_dict = dict(st.secrets["gcp_service_account"]) 
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-    client = gspread.authorize(creds)
-    return client.open("SISTEMA_DB") # Nome da sua planilha
+    try:
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        creds_dict = dict(st.secrets["gcp_service_account"]) 
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        client = gspread.authorize(creds)
+        return client.open("SISTEMA_DB")
+    except Exception as e:
+        st.error(f"Erro de Conexão: {e}")
+        return None
 
-# --- FUNÇÕES DE DADOS (NUVEM) ---
+# --- FUNÇÕES DE BANCO DE DADOS ---
 def carregar_dados(aba):
     try:
         sh = conectar_gsheets()
-        worksheet = sh.worksheet(aba)
-        dados = worksheet.get_all_records()
-        return pd.DataFrame(dados)
+        if sh:
+            ws = sh.worksheet(aba)
+            dados = ws.get_all_records()
+            return pd.DataFrame(dados)
     except: return pd.DataFrame()
+    return pd.DataFrame()
 
 def adicionar_linha(aba, lista):
     sh = conectar_gsheets()
-    worksheet = sh.worksheet(aba)
-    worksheet.append_row(lista)
+    if sh:
+        sh.worksheet(aba).append_row(lista)
 
-# --- FUNÇÕES DE SEGURANÇA E LÓGICA ---
 def hash_pw(pw): return hashlib.sha256(str(pw).encode()).hexdigest()
 
 def login(cie, user, pw):
     df_usr = carregar_dados("Usuarios")
     if df_usr.empty: return "user_error"
     
-    # Filtra usuário e CIE (converte para string para garantir)
+    # Filtra usuário e CIE
     usuario = df_usr[
         (df_usr['user'].astype(str) == str(user)) & 
         (df_usr['cie'].astype(str) == str(cie))
     ]
     
     if not usuario.empty:
-        # Pega a senha hashada da planilha e compara
-        senha_planilha = usuario.iloc[0]['pass']
-        if senha_planilha == hash_pw(pw):
+        if usuario.iloc[0]['pass'] == hash_pw(pw):
             return usuario.iloc[0]
-            
     return "user_error"
 
-def recuperar_acesso(cie, frase_digitada):
-    """Verifica se a frase secreta bate com a planilha"""
-    df_esc = carregar_dados("Escola")
-    if df_esc.empty: return False
-    
-    escola = df_esc[df_esc['cie'].astype(str) == str(cie)]
-    
-    if not escola.empty:
-        chave_real = escola.iloc[0]['chave']
-        if chave_real == hash_pw(frase_digitada):
-            return True
+def recuperar_acesso(cie, frase):
+    df = carregar_dados("Escola")
+    if df.empty: return False
+    esc = df[df['cie'].astype(str) == str(cie)]
+    if not esc.empty and esc.iloc[0]['chave'] == hash_pw(frase): return True
     return False
 
-def salvar_nova_senha(usuario_alvo, nova_senha):
-    """Atualiza a senha diretamente na célula da planilha"""
+def salvar_nova_senha(user, new_pw):
     sh = conectar_gsheets()
-    ws = sh.worksheet("Usuarios")
-    
-    # Procura a célula que tem o nome do usuário
-    cell = ws.find(usuario_alvo)
-    
-    # A senha é sempre a Coluna 2 (Coluna B) na nossa estrutura
-    # Atualiza a célula na mesma linha, coluna 2
-    ws.update_cell(cell.row, 2, hash_pw(nova_senha))
+    if sh:
+        ws = sh.worksheet("Usuarios")
+        cell = ws.find(user)
+        ws.update_cell(cell.row, 2, hash_pw(new_pw))
 
 def instalar_escola(cie, nome, chave, user, pw, nm, cg):
     df = carregar_dados("Escola")
-    # Verifica duplicidade
-    if not df.empty and str(cie) in df['cie'].astype(str).values:
-        return False
-    
-    # Salva na planilha
+    if not df.empty and str(cie) in df['cie'].astype(str).values: return False
     adicionar_linha("Escola", [str(cie), nome, hash_pw(chave)])
+    adicionar_linha("Usuarios", [user, hash_pw(pw), nm, cg, str(cie)])
+    return True
+
+def cadastrar_usuario_extra(user, pw, nm, cg, cie):
+    # Verifica se usuário já existe
+    df = carregar_dados("Usuarios")
+    if not df.empty and user in df['user'].values:
+        return False
     adicionar_linha("Usuarios", [user, hash_pw(pw), nm, cg, str(cie)])
     return True
 
@@ -102,101 +102,105 @@ def mk_pdf(df, escola, user):
         pdf.cell(cols[4],8,str(r['sit'])[:20],1); pdf.ln()
     return pdf.output(dest='S').encode('latin-1')
 
-# --- INTERFACE ---
+# --- APP ---
 if 'logado' not in st.session_state: st.session_state['logado'] = False
 if 'recup_step' not in st.session_state: st.session_state['recup_step'] = 0
 
 if not st.session_state['logado']:
     st.title("☁️ Sistema Escolar Online")
+    t1, t2, t3 = st.tabs(["🔐 Entrar", "🆘 Esqueci a Senha", "🏛️ Cadastrar Escola"])
     
-    tab1, tab2, tab3 = st.tabs(["🔐 Entrar", "🆘 Esqueci a Senha", "🏛️ Cadastrar Escola"])
-    
-    # --- LOGIN ---
-    with tab1:
-        with st.form("log"):
-            cie=st.text_input("CIE"); us=st.text_input("Usuario"); pw=st.text_input("Senha",type="password")
-            if st.form_submit_button("Acessar"):
-                res = login(cie, us, pw)
-                if isinstance(res, str): st.error("Dados incorretos ou escola não cadastrada.")
+    with t1:
+        with st.form("l"):
+            c=st.text_input("CIE"); u=st.text_input("User"); p=st.text_input("Senha",type="password")
+            if st.form_submit_button("Entrar"):
+                res = login(c,u,p)
+                if isinstance(res, str): st.error("Erro de Login.")
                 else: st.session_state['logado']=True; st.session_state['data']=res; st.rerun()
-
-    # --- RECUPERAÇÃO DE SENHA (A PARTE QUE VOCÊ PEDIU) ---
-    with tab2:
-        st.write("Recuperação via Frase Secreta")
-        
-        if st.session_state['recup_step'] == 0:
-            c1, c2 = st.columns(2)
-            r_cie = c1.text_input("CIE da Escola")
-            r_key = c2.text_input("Frase Secreta", type="password")
-            
-            if st.button("Validar Frase"):
-                if recuperar_acesso(r_cie, r_key):
-                    st.session_state['recup_step'] = 1
-                    st.session_state['recup_cie'] = r_cie
-                    st.success("Acesso Liberado! Veja os usuários abaixo.")
-                    st.rerun()
-                else:
-                    st.error("CIE ou Frase incorretos.")
-        
+    
+    with t2:
+        if st.session_state['recup_step']==0:
+            c1,c2=st.columns(2); rc=c1.text_input("CIE"); rk=c2.text_input("Frase",type="password")
+            if st.button("Validar"):
+                if recuperar_acesso(rc,rk): st.session_state['recup_step']=1; st.session_state['recup_cie']=rc; st.rerun()
+                else: st.error("Erro.")
         else:
-            # Passo 2: Listar usuários e trocar senha
-            df_users = carregar_dados("Usuarios")
-            # Filtra usuários daquela escola
-            users_da_escola = df_users[df_users['cie'].astype(str) == str(st.session_state['recup_cie'])]
-            
-            st.info("Selecione o usuário que deseja recuperar:")
-            
-            with st.form("trocar_senha"):
-                target_user = st.selectbox("Usuário", users_da_escola['user'].unique())
-                new_pass = st.text_input("Nova Senha", type="password")
-                
-                if st.form_submit_button("Salvar Nova Senha"):
-                    salvar_nova_senha(target_user, new_pass)
-                    st.success("Senha alterada na nuvem! Volte para a aba 'Entrar'.")
-                    st.session_state['recup_step'] = 0
+            dfu = carregar_dados("Usuarios")
+            if not dfu.empty:
+                users = dfu[dfu['cie'].astype(str)==str(st.session_state['recup_cie'])]
+                target = st.selectbox("Usuário", users['user'].unique())
+                np = st.text_input("Nova Senha", type="password")
+                if st.button("Salvar"): salvar_nova_senha(target, np); st.success("Salvo!"); st.session_state['recup_step']=0
 
-    # --- CADASTRO DE ESCOLA ---
-    with tab3:
-        with st.form("cad_esc"):
-            c1,c2=st.columns(2); cie_n=c1.text_input("CIE"); esc_n=c2.text_input("Escola")
-            key_n=st.text_input("Frase Secreta (Guarde bem!)",type="password")
-            st.divider(); nm_n=st.text_input("Nome Admin"); us_n=st.text_input("User Admin"); pw_n=st.text_input("Senha Admin",type="password")
-            cg_n = st.selectbox("Cargo", ["PROATI", "Diretor", "Vice-Diretor"])
-            
-            if st.form_submit_button("Criar Escola"):
-                if instalar_escola(cie_n, esc_n, key_n, us_n, pw_n, nm_n, cg_n):
-                    st.success("Escola Criada! Faça login na primeira aba."); st.balloons()
-                else: st.error("Erro ou CIE já existe.")
+    with t3:
+        with st.form("ne"):
+            c1,c2=st.columns(2); ci=c1.text_input("CIE"); es=c2.text_input("Escola"); ky=st.text_input("Frase",type="password")
+            st.divider(); nm=st.text_input("Nome"); us=st.text_input("User"); pw=st.text_input("Senha",type="password")
+            cg = st.selectbox("Cargo", CARGOS_ADMIN) # Apenas admins criam escola
+            if st.form_submit_button("Criar"):
+                if instalar_escola(ci,es,ky,us,pw,nm,cg): st.success("Criado!"); st.balloons()
+                else: st.error("Erro.")
 
 else:
-    # --- ÁREA LOGADA ---
     ud = st.session_state['data']
-    st.sidebar.title(f"Olá, {ud['nome']}")
-    st.sidebar.info(f"CIE: {ud['cie']}\nCargo: {ud['cargo']}")
+    st.sidebar.title(ud['nome']); st.sidebar.info(f"{ud['cargo']}\nCIE: {ud['cie']}")
     if st.sidebar.button("Sair"): st.session_state['logado']=False; st.rerun()
     
-    menu = st.sidebar.radio("Menu", ["Cadastro", "Consulta"])
+    # --- LÓGICA DE PERMISSÃO ---
+    # Verifica se o cargo do usuário está na lista VIP
+    eh_admin = ud['cargo'] in CARGOS_ADMIN
     
-    if menu == "Cadastro":
+    if eh_admin:
+        # Menu completo para Chefes
+        opcoes = ["📝 Cadastro Equipamento", "🔎 Consulta", "👥 Gestão de Equipe"]
+    else:
+        # Menu restrito para Professores/Outros
+        opcoes = ["🔎 Consulta"]
+
+    menu = st.sidebar.radio("Menu Principal", opcoes)
+    
+    # --- CADASTRO (Só Admin vê) ---
+    if menu == "📝 Cadastro Equipamento":
         st.header("Novo Equipamento")
         with st.form("cad"):
-            c1,c2=st.columns(2)
-            tp=c1.selectbox("Tipo", ["Chromebook", "Notebook", "Desktop", "Tablet", "Outros"])
-            nm=c2.text_input("Modelo/Nome")
-            sn=c1.text_input("Serial"); pat=c2.text_input("Patrimônio"); nf=st.text_input("Nota Fiscal")
-            sit=st.selectbox("Situação", ["Operacional", "Inoperante"]); prob=st.text_area("Problema")
-            
-            if st.form_submit_button("Salvar na Nuvem"):
-                adicionar_linha("Equipamentos", [tp, nm, sn, pat, nf, sit, prob, datetime.now().strftime("%d/%m/%Y"), ud['nome'], str(ud['cie'])])
-                st.success("Salvo no Google Drive!")
+            c1,c2=st.columns(2); tp=c1.selectbox("Tipo", ["Chromebook", "Notebook", "Desktop", "Tablet", "Outros"])
+            nm=c2.text_input("Modelo"); sn=c1.text_input("Serial"); pt=c2.text_input("Patrimônio"); nf=st.text_input("NF")
+            st=c1.selectbox("Situação", ["Operacional","Inoperante"]); pb=c2.text_area("Problema")
+            if st.form_submit_button("Salvar"):
+                adicionar_linha("Equipamentos", [tp,nm,sn,pt,nf,st,pb,datetime.now().strftime("%d/%m/%Y"),ud['nome'],str(ud['cie'])])
+                st.success("Salvo!")
 
-    elif menu == "Consulta":
-        st.header("Inventário Online")
+    # --- CONSULTA (Todos veem) ---
+    elif menu == "🔎 Consulta":
+        st.header("Inventário")
         df = carregar_dados("Equipamentos")
         if not df.empty:
-            df = df[df['cie'].astype(str) == str(ud['cie'])] # Filtra escola
+            df = df[df['cie'].astype(str)==str(ud['cie'])]
             st.dataframe(df)
-            if st.button("Gerar PDF"):
-                st.download_button("Baixar PDF", mk_pdf(df, str(ud['cie']), ud['nome']), "relatorio.pdf")
-        else:
-            st.info("Nenhum dado encontrado.")
+            if st.button("PDF"): st.download_button("Baixar PDF", mk_pdf(df, str(ud['cie']), ud['nome']), "rel.pdf")
+        else: st.info("Vazio")
+
+    # --- GESTÃO DE EQUIPE (Só Admin vê) ---
+    elif menu == "👥 Gestão de Equipe":
+        st.header("Cadastrar Novos Usuários")
+        st.info("Adicione professores ou outros funcionários para acessarem o sistema (apenas leitura).")
+        
+        with st.form("new_user"):
+            c1,c2 = st.columns(2)
+            n_nome = c1.text_input("Nome Completo")
+            n_cargo = c2.selectbox("Cargo", CARGOS_GERAL)
+            n_user = c1.text_input("Login (Usuário)")
+            n_pass = c2.text_input("Senha", type="password")
+            
+            if st.form_submit_button("Cadastrar Usuário"):
+                if cadastrar_usuario_extra(n_user, n_pass, n_nome, n_cargo, ud['cie']):
+                    st.success(f"Usuário {n_nome} cadastrado com sucesso!")
+                else:
+                    st.error("Erro: Usuário já existe.")
+        
+        st.divider()
+        st.subheader("Equipe Atual")
+        df_u = carregar_dados("Usuarios")
+        if not df_u.empty:
+            # Mostra apenas usuários da mesma escola
+            st.dataframe(df_u[df_u['cie'].astype(str) == str(ud['cie'])][['nome', 'cargo', 'user']], use_container_width=True)
